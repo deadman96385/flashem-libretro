@@ -1,5 +1,7 @@
 #include "vflash.h"
 #include "debugger.h"
+#include "audio.h"
+#include "frame_pacer.h"
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +11,6 @@ static void print_usage(const char *prog) {
         "FlashEm - V.Flash emulator\n"
         "Usage: %s [options] <disc.iso>\n\n"
         "Options:\n"
-        "  --debug      Enable I/O trace and register dumps\n"
         "  --dbg        Start interactive debugger (paused at boot)\n"
         "  --dbg-run    Start interactive debugger (running)\n"
         "  --headless   Run without display\n"
@@ -19,7 +20,6 @@ static void print_usage(const char *prog) {
         "  Arrow keys   D-Pad\n"
         "  Z / X / C / V  Red/Yellow/Green/Blue\n"
         "  Enter        Enter/OK\n"
-        "  F1           Toggle debug trace\n"
         "  F2           Pause/resume debugger\n"
         "  F11          Toggle fullscreen\n"
         "  Esc          Quit\n\n"
@@ -38,6 +38,17 @@ static void print_usage(const char *prog) {
         "  setreg r0=1  write register\n"
         "  q            quit\n",
         prog);
+}
+
+/* Line-buffer a log stream. The Windows C runtime treats _IOLBF as full
+ * buffering, so there it is unbuffered instead - logs must not sit in a
+ * buffer when a run is killed. */
+static void line_buffered(FILE *f) {
+#ifdef _WIN32
+    setvbuf(f, NULL, _IONBF, 0);
+#else
+    setvbuf(f, NULL, _IOLBF, BUFSIZ);
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -98,11 +109,11 @@ int main(int argc, char **argv) {
         );
         if (!win) {
             fprintf(stderr, "[SDL] Window failed: %s\n", SDL_GetError());
-            SDL_Quit(); vflash_destroy(vf); return 1;
+            vflash_destroy(vf); SDL_Quit(); return 1;
         }
 
         ren = SDL_CreateRenderer(win, -1,
-            SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+            SDL_RENDERER_ACCELERATED);
         if (!ren) ren = SDL_CreateRenderer(win, -1, 0);
 
         tex = SDL_CreateTexture(ren,
@@ -121,9 +132,9 @@ int main(int argc, char **argv) {
         const char *logfile = getenv("VFLASH_LOG");
         if (logfile) {
             FILE *lf = freopen(logfile, "w", stdout);
-            if (lf) setlinebuf(lf);
+            if (lf) line_buffered(lf);
         } else {
-            setlinebuf(stdout);
+            line_buffered(stdout);
         }
     }
 
@@ -133,10 +144,14 @@ int main(int argc, char **argv) {
     uint32_t  fps_timer = SDL_GetTicks();
     int       fps_count = 0;
     char      title[64];
+    Audio *audio = vflash_get_audio(vf);
+    FramePacer pacer;
+    frame_pacer_reset(&pacer);
 
     while (running) {
         uint32_t buttons = 0;
-        uint32_t frame_start = SDL_GetTicks();
+        int accelerated = !dbg_mode && vflash_fast_booting(vf);
+        audio_set_discard(audio, accelerated);
 
         /* Events */
         while (SDL_PollEvent(&ev)) {
@@ -147,11 +162,6 @@ int main(int argc, char **argv) {
             if (ev.type == SDL_KEYDOWN) {
                 switch (ev.key.keysym.sym) {
                     case SDLK_ESCAPE: printf("[Main] ESC pressed\n"); running = 0; break;
-                    case SDLK_F1:
-                        debug = !debug;
-                        vflash_set_debug(vf, debug);
-                        printf("[Main] Debug %s\n", debug ? "ON" : "OFF");
-                        break;
                     case SDLK_F2:
                         if (dbg_mode) {
                             if (dbg_is_running()) dbg_pause(vf);
@@ -161,8 +171,10 @@ int main(int argc, char **argv) {
                     case SDLK_F5: {
                         /* Save screenshot as BMP */
                         uint32_t *fb = vflash_get_framebuffer(vf);
+                        int sw, sh;
+                        vflash_get_screen_size(vf, &sw, &sh);
                         SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
-                            fb, 320, 240, 32, 320*4,
+                            fb, sw, sh, 32, sw*4,
                             0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
                         if (surf) {
                             SDL_SaveBMP(surf, "screenshot.bmp");
@@ -194,28 +206,6 @@ int main(int argc, char **argv) {
             if (keys[SDL_SCANCODE_C])      buttons |= VFLASH_BTN_GREEN;
             if (keys[SDL_SCANCODE_V])      buttons |= VFLASH_BTN_BLUE;
             if (keys[SDL_SCANCODE_RETURN]) buttons |= VFLASH_BTN_ENTER;
-        } else {
-            /* Headless auto-input: simulate button presses to progress
-             * past title screens and menus.
-             * Schedule: Enter at 3s, 5s, 8s; Red at 10s, 15s, 20s;
-             * then cycle Enter+Red every 10s. */
-            uint32_t sec = SDL_GetTicks() / 1000;
-            if (sec >= 3 && sec < 4)  buttons |= VFLASH_BTN_ENTER;
-            if (sec >= 5 && sec < 6)  buttons |= VFLASH_BTN_ENTER;
-            if (sec >= 8 && sec < 9)  buttons |= VFLASH_BTN_ENTER;
-            if (sec >= 10 && sec < 11) buttons |= VFLASH_BTN_RED;
-            if (sec >= 15 && sec < 16) buttons |= VFLASH_BTN_RED;
-            if (sec >= 20 && sec < 21) buttons |= VFLASH_BTN_ENTER;
-            if (sec >= 25 && sec < 26) buttons |= VFLASH_BTN_RED;
-            if (sec >= 30 && sec < 31) buttons |= VFLASH_BTN_ENTER;
-            if (sec >= 35 && sec < 36) buttons |= VFLASH_BTN_RED;
-            if (sec >= 40) {
-                /* Cycle Enter/Red every 5 seconds */
-                uint32_t phase = (sec - 40) / 5;
-                uint32_t in_phase = (sec - 40) % 5;
-                if (in_phase == 0)
-                    buttons |= (phase % 2) ? VFLASH_BTN_RED : VFLASH_BTN_ENTER;
-            }
         }
         vflash_set_input(vf, buttons);
 
@@ -239,28 +229,63 @@ int main(int argc, char **argv) {
     render:
         /* Auto-screenshot in headless mode after game starts */
         if (headless) {
-            static int screenshot_done = 0;
-            if (!screenshot_done && fps_count >= 50) {
+            /* fps_count resets every second, so it cannot say how far the
+             * game has got; count frames since start instead. */
+            /* VFLASH_SHOT_FRAME may list several frames ("600,1500,3000");
+             * a %d in VFLASH_SHOT is replaced by the frame number. */
+            static int total_frames = 0, nshots = -1, next_shot = 0;
+            static int shot_frames[256];
+            if (nshots < 0) {
+                const char *sf = getenv("VFLASH_SHOT_FRAME");
+                nshots = 0;
+                if (!sf) shot_frames[nshots++] = 50;
+                while (sf && *sf && nshots < 256) {
+                    shot_frames[nshots++] = atoi(sf);
+                    sf = strchr(sf, ',');
+                    if (sf) sf++;
+                }
+            }
+            total_frames++;
+            if (next_shot < nshots && total_frames >= shot_frames[next_shot]) {
                 uint32_t *fb = vflash_get_framebuffer(vf);
-                FILE *pf = fopen("/tmp/vflash_screen.ppm", "wb");
+                int sw, sh;
+                vflash_get_screen_size(vf, &sw, &sh);
+                const char *spat = getenv("VFLASH_SHOT") ? getenv("VFLASH_SHOT") : "/tmp/vflash_screen.ppm";
+                char sp[512];
+                snprintf(sp, sizeof sp, spat, total_frames);
+                FILE *pf = fopen(sp, "wb");
                 if (pf) {
-                    fprintf(pf, "P6\n320 240\n255\n");
-                    for (int i = 0; i < 320*240; i++) {
+                    fprintf(pf, "P6\n%d %d\n255\n", sw, sh);
+                    for (int i = 0; i < sw*sh; i++) {
                         uint32_t p = fb[i];
                         uint8_t rgb[3] = {(p>>16)&0xFF, (p>>8)&0xFF, p&0xFF};
                         fwrite(rgb, 1, 3, pf);
                     }
                     fclose(pf);
-                    printf("[SCREENSHOT] Saved /tmp/vflash_screen.ppm (frame %d)\n", fps_count);
+                    printf("[SCREENSHOT] Saved %s (frame %d)\n", sp, total_frames);
                 }
-                screenshot_done = 1;
+                next_shot++;
             }
         }
         /* Render */
-        if (!headless && win) {
+        /* Reduce rendering overhead during accelerated boot. */
+        static unsigned boot_frames;
+        if (!headless && win && !(vflash_fast_booting(vf) && (boot_frames++ & 7))) {
+            /* The picture size follows the machine (320x240, or 320x288 on
+             * a PAL system); the texture is remade when it changes. */
+            static int tex_w = VFLASH_SCREEN_W, tex_h = VFLASH_SCREEN_H;
+            int sw, sh;
+            vflash_get_screen_size(vf, &sw, &sh);
+            if (sw != tex_w || sh != tex_h) {
+                SDL_DestroyTexture(tex);
+                tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                        SDL_TEXTUREACCESS_STREAMING, sw, sh);
+                SDL_RenderSetLogicalSize(ren, sw * 3 / 4 * 4 / 3, sw * 3 / 4);
+                tex_w = sw; tex_h = sh;
+            }
             SDL_UpdateTexture(tex, NULL,
                 vflash_get_framebuffer(vf),
-                VFLASH_SCREEN_W * sizeof(uint32_t));
+                sw * sizeof(uint32_t));
             SDL_RenderClear(ren);
             SDL_RenderCopy(ren, tex, NULL, NULL);
             SDL_RenderPresent(ren);
@@ -284,12 +309,16 @@ int main(int argc, char **argv) {
             fps_timer = now;
         }
 
-        /* Frame timing — target 60fps (skip delay when debugger paused) */
-        if (!dbg_mode || dbg_is_running()) {
-            uint32_t elapsed = SDL_GetTicks() - frame_start;
-            if (elapsed < 16) SDL_Delay(16 - elapsed);
+        /* Fractional deadlines avoid the 62.5 Hz drift of a 16 ms delay.
+         * Rendering is not vsynced: display refresh must not clock audio. */
+        if (accelerated) {
+            frame_pacer_reset(&pacer);
+        } else if (!dbg_mode || dbg_is_running()) {
+            frame_pacer_wait(&pacer, audio);
         } else {
+            audio_clear(audio);
             SDL_Delay(16);  /* Paused: still yield CPU */
+            frame_pacer_reset(&pacer);
         }
     }
 
@@ -297,8 +326,8 @@ int main(int argc, char **argv) {
     if (tex) SDL_DestroyTexture(tex);
     if (ren) SDL_DestroyRenderer(ren);
     if (win) SDL_DestroyWindow(win);
-    SDL_Quit();
     vflash_destroy(vf);
+    SDL_Quit();
     printf("[Main] Exited cleanly\n");
     return 0;
 }

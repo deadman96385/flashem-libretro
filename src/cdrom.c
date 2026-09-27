@@ -26,8 +26,12 @@ static int resolve_cue(const char *path, char *binpath, size_t binpath_size) {
         char *q2 = strchr(q1 + 1, '"');
         if (!q2) continue;
         *q2 = 0;
-        /* Build path relative to cue file's directory */
+        /* Build path relative to cue file's directory ('\' separates too on Windows) */
         const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+        const char *bslash = strrchr(path, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
         if (slash) {
             size_t dirlen = (size_t)(slash - path + 1);
             if (dirlen + strlen(q1 + 1) >= binpath_size) { fclose(f); return 0; }
@@ -44,9 +48,31 @@ static int resolve_cue(const char *path, char *binpath, size_t binpath_size) {
     return 0;
 }
 
+/* TRACK/INDEX 01 lines of a single-file cue sheet. */
+static void parse_cue_tracks(CDROM *cd, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        unsigned n, m, s, fr;
+        char mode[32];
+        if (sscanf(line, " TRACK %u %31s", &n, mode) == 2 && cd->ntracks < 99) {
+            cd->track[cd->ntracks].num = (uint8_t)n;
+            cd->track[cd->ntracks].ctrl = strncasecmp(mode, "AUDIO", 5) ? 4 : 0;
+            cd->track[cd->ntracks].start = 0;
+            cd->ntracks++;
+        } else if (sscanf(line, " INDEX 01 %u:%u:%u", &m, &s, &fr) == 3 && cd->ntracks) {
+            cd->track[cd->ntracks - 1].start = (m * 60 + s) * 75 + fr;
+        }
+    }
+    fclose(f);
+}
+
 int cdrom_open(CDROM *cd, const char *path) {
     /* Handle .cue files by extracting the .bin path */
     char resolved[1024];
+    cd->ntracks = 0;
+    parse_cue_tracks(cd, path);
     if (resolve_cue(path, resolved, sizeof(resolved))) {
         printf("[CDROM] CUE -> BIN: %s\n", resolved);
         path = resolved;
@@ -75,6 +101,10 @@ int cdrom_open(CDROM *cd, const char *path) {
         cd->data_offset = 0;
         cd->sector_count = (uint32_t)(file_size / CDROM_SECTOR_SIZE);
         printf("[CDROM] Opened ISO (2048): %s (%u sectors)\n", path, cd->sector_count);
+    }
+    if (!cd->ntracks) {
+        cd->ntracks = 1;
+        cd->track[0].num = 1; cd->track[0].ctrl = 4; cd->track[0].start = 0;
     }
     cd->is_open = 1;
     return 1;
@@ -281,4 +311,12 @@ int cdrom_read_file(CDROM *cd, const CDEntry *entry,
         lba++;
     }
     return (int)read;
+}
+
+/* The whole 2352-byte sector (sync, header, data, EDC/ECC). A 2048-byte
+ * image has no ECC to give; the caller gets 0 and must make its own. */
+int cdrom_read_raw(CDROM *cd, uint32_t lba, uint8_t *buf) {
+    if (!cd->is_open || lba >= cd->sector_count || cd->raw_sector_size != CDROM_RAW_SIZE) return 0;
+    fseek(cd->fp, (long)lba * CDROM_RAW_SIZE, SEEK_SET);
+    return fread(buf, 1, CDROM_RAW_SIZE, cd->fp) == CDROM_RAW_SIZE;
 }

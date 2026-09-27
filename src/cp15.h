@@ -45,7 +45,8 @@ typedef struct {
     int icache_enabled;
     int write_buffer;
     int hivec;          /* 1 = vectors at 0xFFFF0000, 0 = vectors at 0x00000000 */
-    int tlb_flush_needed; /* Set by MCR c8, checked by mmu_translate */
+    uint32_t tlb_gen;   /* bumped whenever cached translations go stale (MMU on/off,
+                         * TTB, c8 TLB operations, reset); hw.c's TLB follows it */
 } CP15;
 
 /* Control register bits */

@@ -16,6 +16,11 @@ struct CDROM {
     uint32_t raw_sector_size; /* 2048 for ISO, 2352 for BIN */
     uint32_t data_offset;     /* 0 for ISO, 16 for BIN (skip sync+header) */
     int      is_open;
+    /* Table of contents from the cue sheet (one data track for a bare image):
+     * start is the LBA of each track's INDEX 01, ctrl the Q control nibble
+     * (4 = data, 0 = audio). */
+    int      ntracks;
+    struct { uint8_t num, ctrl; uint32_t start; } track[99];
 };
 typedef struct CDROM CDROM;
 
@@ -31,6 +36,7 @@ void     cdrom_destroy(CDROM *cd);
 int      cdrom_open(CDROM *cd, const char *path);
 void     cdrom_close(CDROM *cd);
 int      cdrom_read_sector(CDROM *cd, uint32_t lba, uint8_t *buf);
+int      cdrom_read_raw(CDROM *cd, uint32_t lba, uint8_t *buf);   /* 2352 bytes, raw images only */
 
 /* Find file by path (supports subdirs: "GAME/DATA/BOOT.BIN") */
 int      cdrom_find_file(CDROM *cd, const char *path, CDEntry *entry);

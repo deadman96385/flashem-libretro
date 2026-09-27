@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "libretro.h"
 #include "vflash.h"
@@ -21,8 +22,7 @@
 #define FLASHEM_FPS          60.0
 #define FLASHEM_SAMPLE_RATE  ((double)AUDIO_SAMPLE_RATE)
 
-/* One frame of stereo at 44100/60, with room for the jitter a frame of
- * emulation produces - the ring buffer is drained dry every frame either way. */
+/* Up to two frames of stereo, allowing bounded emulation timing jitter. */
 #define FLASHEM_AUDIO_MAX    ((AUDIO_SAMPLE_RATE / 30) * 2)
 
 static retro_environment_t   environ_cb;
@@ -35,6 +35,34 @@ static retro_log_printf_t    log_cb;
 
 static VFlash *s_vf;
 static int16_t s_audio[FLASHEM_AUDIO_MAX];
+static uint32_t s_audio_count, s_audio_offset;
+
+/* Preserve samples a frontend did not accept; never split stereo frames. */
+static void flashem_audio_output(Audio *audio)
+{
+   if (!audio || (!audio_batch_cb && !audio_cb)) return;
+   if (s_audio_offset == s_audio_count)
+   {
+      s_audio_count = audio_pull_samples(audio, s_audio, FLASHEM_AUDIO_MAX);
+      s_audio_offset = 0;
+   }
+   uint32_t frames = (s_audio_count - s_audio_offset) / 2;
+   if (!frames) return;
+   if (audio_batch_cb)
+   {
+      size_t used = audio_batch_cb(s_audio + s_audio_offset, frames);
+      if (used > frames) used = frames;
+      s_audio_offset += (uint32_t)used * 2;
+   }
+   else
+   {
+      while (s_audio_offset < s_audio_count)
+      {
+         audio_cb(s_audio[s_audio_offset], s_audio[s_audio_offset + 1]);
+         s_audio_offset += 2;
+      }
+   }
+}
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -77,6 +105,7 @@ void retro_init(void)
 
 void retro_deinit(void)
 {
+   s_audio_count = s_audio_offset = 0;
    if (s_vf)
    {
       vflash_destroy(s_vf);
@@ -101,8 +130,8 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    memset(info, 0, sizeof(*info));
    info->geometry.base_width   = VFLASH_SCREEN_W;
    info->geometry.base_height  = VFLASH_SCREEN_H;
-   info->geometry.max_width    = VFLASH_SCREEN_W;
-   info->geometry.max_height   = VFLASH_SCREEN_H;
+   info->geometry.max_width    = VFLASH_FB_MAX_W;
+   info->geometry.max_height   = VFLASH_FB_MAX_H;
    info->geometry.aspect_ratio = 4.0f / 3.0f;
    info->timing.fps            = FLASHEM_FPS;
    info->timing.sample_rate    = FLASHEM_SAMPLE_RATE;
@@ -161,29 +190,42 @@ void retro_run(void)
       input_poll_cb();
 
    vflash_set_input(s_vf, flashem_poll_buttons());
+   audio = (Audio*)vflash_get_audio(s_vf);
+   int accelerated = vflash_fast_booting(s_vf);
+   audio_set_discard(audio, accelerated);
    vflash_run_frame(s_vf);
+   /* Fast boot: while the ROM is still starting the game, fit as many
+    * frames into this one as ~12 ms allows. */
+   if (vflash_fast_booting(s_vf))
+   {
+      clock_t until = clock() + CLOCKS_PER_SEC * 12 / 1000;
+      while (vflash_fast_booting(s_vf) && clock() < until)
+         vflash_run_frame(s_vf);
+   }
 
    fb = vflash_get_framebuffer(s_vf);
    if (fb && video_cb)
-      video_cb(fb, VFLASH_SCREEN_W, VFLASH_SCREEN_H,
-               VFLASH_SCREEN_W * sizeof(uint32_t));
-
-   /* Whatever the frame produced, in one batch. Left in the ring buffer it
-    * would only be overwritten by the next one. */
-   audio = (Audio*)vflash_get_audio(s_vf);
-   if (audio && audio_batch_cb)
    {
-      uint32_t got = audio_pull_samples(audio, s_audio, FLASHEM_AUDIO_MAX);
-
-      /* The buffer is interleaved stereo, so a frame is two samples. An odd
-       * count would put the channels out of step from here on. */
-      if (got >= 2)
-         audio_batch_cb(s_audio, got / 2);
+      int w, h;
+      vflash_get_screen_size(s_vf, &w, &h);
+      video_cb(fb, (unsigned)w, (unsigned)h, (size_t)w * sizeof(uint32_t));
    }
+
+   if (accelerated)
+   {
+      /* One silent frontend frame, regardless of how many boot frames ran.
+       * Also discard any partially accepted batch from the previous call. */
+      audio_set_discard(audio, 0);
+      memset(s_audio, 0, sizeof(s_audio));
+      s_audio_offset = 0;
+      s_audio_count = (AUDIO_SAMPLE_RATE / 60) * AUDIO_CHANNELS;
+   }
+   flashem_audio_output(audio);
 }
 
 bool retro_load_game(const struct retro_game_info *game)
 {
+   s_audio_count = s_audio_offset = 0;
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 
    static const struct retro_input_descriptor desc[] = {
@@ -215,9 +257,8 @@ bool retro_load_game(const struct retro_game_info *game)
 
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)desc);
 
-   /* The boot ROM is optional - without it the emulator boots the disc by HLE -
-    * but when one is there it belongs in the frontend's system directory, not
-    * in whatever the working directory happens to be. */
+   /* The boot ROM is required - the machine boots from it - and belongs in the
+    * frontend's system directory, not whatever the working directory is. */
    {
       const char *sysdir = NULL;
       if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sysdir) && sysdir)
@@ -230,7 +271,8 @@ bool retro_load_game(const struct retro_game_info *game)
    s_vf = vflash_create(game->path);
    if (!s_vf)
    {
-      log_cb(RETRO_LOG_ERROR, "FlashEm: could not open '%s'\n", game->path);
+      log_cb(RETRO_LOG_ERROR, "FlashEm: could not start '%s' - is 70004.bin in the "
+             "system directory?\n", game->path);
       return false;
    }
 
@@ -253,6 +295,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info,
 
 void retro_unload_game(void)
 {
+   s_audio_count = s_audio_offset = 0;
    if (s_vf)
    {
       vflash_destroy(s_vf);

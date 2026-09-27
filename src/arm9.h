@@ -32,6 +32,8 @@ struct ARM9 {
 
     /* Banked registers per mode */
     uint32_t r8_fiq,  r9_fiq,  r10_fiq, r11_fiq, r12_fiq;
+    uint32_t r8_usr,  r9_usr,  r10_usr, r11_usr, r12_usr;  /* R8-R12 outside FIQ */
+    uint32_t r13_usr, r14_usr;                                /* USR and SYS */
     uint32_t r13_fiq, r14_fiq, spsr_fiq;
     uint32_t r13_irq, r14_irq, spsr_irq;
     uint32_t r13_svc, r14_svc, spsr_svc;
@@ -51,15 +53,11 @@ struct ARM9 {
     void     (*mem_write32)(void *ctx, uint32_t addr, uint32_t val);
     void     (*mem_write16)(void *ctx, uint32_t addr, uint16_t val);
     void     (*mem_write8) (void *ctx, uint32_t addr, uint8_t  val);
-
-    /* Callback for UNDEF recovery — copies ROM to RAM for µMORE */
-    void     (*undef_callback)(void *ctx);
-    int      null_trap_enabled; /* set by Phase 2 to enable NULL trap */
-
-    /* HLE service intercept: called when PC matches a registered address.
-     * Returns 1 if handled (skip instruction execution), 0 to continue. */
-    int      (*hle_intercept)(void *ctx, uint32_t addr);
-    void     *hle_ctx;
+    /* Optional: host memory behind the 4 KB page holding addr, or NULL.
+     * Instruction fetches read through it while cp15.tlb_gen stays put. */
+    const uint8_t *(*mem_page)(void *ctx, uint32_t addr);
+    const uint8_t *fetch_ptr;
+    uint32_t fetch_page, fetch_gen;
 
     /* VFP (Vector Floating-Point) coprocessor state — CP10/CP11 */
     float    vfp_s[32];     /* S0-S31 single-precision registers */

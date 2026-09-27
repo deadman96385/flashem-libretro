@@ -11,7 +11,9 @@
 #define ARM926_CACHE_TYPE   0x1D172172  /* 8KB I-cache, 8KB D-cache, write-back */
 
 void cp15_reset(CP15 *cp) {
+    uint32_t gen = cp->tlb_gen;
     memset(cp, 0, sizeof(CP15));
+    cp->tlb_gen = gen + 1;
 
     /* c0 - ID registers */
     cp->id         = ARM926_MAIN_ID;
@@ -73,6 +75,7 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
             cp->icache_enabled = (val & CP15_CTRL_ICACHE) ? 1 : 0;
             cp->write_buffer   = (val & CP15_CTRL_WBUF)   ? 1 : 0;
             cp->hivec          = (val & CP15_CTRL_HIVEC)  ? 1 : 0;
+            if (was_mmu != cp->mmu_enabled) cp->tlb_gen++;
             /* Log MMU enable transition (not repeated context switch writes) */
             if (!was_mmu && cp->mmu_enabled) {
                 printf("[CP15] MMU ENABLED! TTB=0x%08X HIVEC=%d\n", cp->ttb, cp->hivec);
@@ -84,6 +87,7 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
         }
         case 2:  /* TTB */
             cp->ttb = val & ~0x3FFFu;
+            cp->tlb_gen++;
             printf("[CP15] TTB=0x%08X\n", cp->ttb);
             break;
         case 3:  /* Domain */
@@ -109,9 +113,9 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
             break;
         case 8:  /* TLB operations — invalidate TLB */
             /* CRm=7: unified, CRm=5: I-TLB, CRm=6: D-TLB
-             * op2=0: invalidate all, op2=1: invalidate by MVA
-             * Signal to vflash.c's TLB cache via global flag */
-            cp->tlb_flush_needed = 1;
+             * op2=0: invalidate all, op2=1: invalidate by MVA - hw.c's
+             * whole TLB goes either way */
+            cp->tlb_gen++;
             break;
         case 9:  /* TCM */
             if (op2 == 0) { cp->dtcm_base = val; printf("[CP15] DTCM base=0x%08X\n", val); }

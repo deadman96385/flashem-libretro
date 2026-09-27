@@ -3,37 +3,20 @@
 #include <stddef.h>
 #include <stdio.h>
 
-/* V.Flash Hardware Specs
- * CPU: LSI Logic ZEVIO 1020 SoC, ARM926EJ-S @ 150MHz
+/* V.Flash (V.Smile Pro)
+ * SoC: LSI Logic ZEVIO 1020 - ARM926EJ-S @ 150MHz, the chip in the TI-Nspire Classic
  * RAM: 16MB SDRAM
  * Media: CD-ROM, ISO 9660, no copy protection
- * Video: Motion JPEG (.mjp), raw picture (.ptx)
- * Audio: PCM WAV (.snd)
- * OS: uMORE v4.0 RTOS
- */
+ * OS: µMORE v4.0 RTOS, booted by the 2MB boot ROM (70004.bin, required)
+ *
+ * The machine itself is src/hw.c; this is the interface frontends use. */
 
-#define VFLASH_RAM_SIZE     (16 * 1024 * 1024)  /* 16MB SDRAM */
-#define VFLASH_ROM_SIZE     (512 * 1024)         /* 512KB boot ROM (estimated) */
-#define VFLASH_SRAM_BASE    0x0FFE0000           /* Internal SRAM / TCM */
-#define VFLASH_SRAM_SIZE    (128 * 1024)         /* 128KB (estimated) */
 #define VFLASH_SCREEN_W     320
 #define VFLASH_SCREEN_H     240
-
-/* Memory map */
-#define VFLASH_ROM_BASE     0x00000000
-#define VFLASH_RAM_BASE     0x10000000
-#define VFLASH_IO_BASE      0x80000000
-
-/* ZEVIO 1020 I/O regions (verified from RTOS RE) */
-#define ZEVIO_TIMER_BASE    0xB000000C  /* Timer block: 64 timers, stride 0x40 */
-#define ZEVIO_INTC_BASE     0xB0001000  /* SoC interrupt controller */
-#define ZEVIO_VIC_BASE      0xDC000000  /* ARM VIC (IRQ=+0x00, FIQ=+0x100) */
-
-/* Legacy I/O (estimated) */
-#define VFLASH_IO_CDROM     0x80001000
-#define VFLASH_IO_VIDEO     0x80002000
-#define VFLASH_IO_AUDIO     0x80003000
-#define VFLASH_IO_INPUT     0x80004000
+/* Largest picture the video engine produces (PAL, 352x288); the framebuffer
+ * is this big, and vflash_get_screen_size() says how much of it is used. */
+#define VFLASH_FB_MAX_W     512
+#define VFLASH_FB_MAX_H     288
 
 /* Input buttons */
 #define VFLASH_BTN_UP       (1 << 0)
@@ -46,52 +29,46 @@
 #define VFLASH_BTN_BLUE     (1 << 7)
 #define VFLASH_BTN_ENTER    (1 << 8)
 
-typedef struct VFlash    VFlash;
+typedef struct VFlash VFlash;
 
-/* JIT accessors — allows jit.c to access VFlash internals */
-void    *vflash_get_cpu(VFlash *vf);   /* returns ARM9* */
-void    *vflash_get_timer(VFlash *vf); /* returns ZevioTimer* */
-uint8_t *vflash_get_ram(VFlash *vf);
-typedef struct ARM9      ARM9;
-typedef struct CDROM     CDROM;
-typedef struct MJPDecoder MJPDecoder;
-
-VFlash* vflash_create(const char *disc_path);
 /* Directory to look in for the boot ROM (70004.bin), as <dir>/flashem/70004.bin
  * or <dir>/70004.bin. Set it before vflash_create(); a frontend passes its own
- * system directory here. */
-void    vflash_set_bios_dir(const char *dir);
-void    vflash_destroy(VFlash *vf);
-void    vflash_run_frame(VFlash *vf);
-void    vflash_set_input(VFlash *vf, uint32_t buttons);
-uint32_t* vflash_get_framebuffer(VFlash *vf);
-void    vflash_init_audio(VFlash *vf);
+ * system directory here. $FLASHEM_BIOS and ./70004.bin are tried after it. */
+void      vflash_set_bios_dir(const char *dir);
+/* NULL if the boot ROM cannot be found or the disc image cannot be opened. */
+VFlash   *vflash_create(const char *disc_path);
+void      vflash_destroy(VFlash *vf);
+void      vflash_run_frame(VFlash *vf);
+/* 1 while the ROM is still starting a disc's game (see hw_booting) and fast
+ * boot is on (the default; VFLASH_FASTBOOT=0 turns it off): frontends may
+ * run frames back to back and show only some of them. */
+int       vflash_fast_booting(VFlash *vf);
+void      vflash_set_input(VFlash *vf, uint32_t buttons);
+uint32_t *vflash_get_framebuffer(VFlash *vf);
+/* Current picture size; the framebuffer's pitch is width * 4 bytes. */
+void      vflash_get_screen_size(VFlash *vf, int *w, int *h);
+void      vflash_init_audio(VFlash *vf);
 /* The audio ring buffer, for a frontend that takes the samples itself
  * (see audio_init_external / audio_pull_samples). */
 struct Audio;
-void   *vflash_get_audio(VFlash *vf);
-void    vflash_set_debug(VFlash *vf, int on);
+void     *vflash_get_audio(VFlash *vf);
+void      vflash_set_debug(VFlash *vf, int on);
 
 /* ---- Debugger API ---- */
-/* Access CPU state */
 uint32_t  vflash_get_pc(VFlash *vf);
 uint32_t  vflash_get_reg(VFlash *vf, int r);
 void      vflash_set_reg(VFlash *vf, int r, uint32_t val);
 uint32_t  vflash_get_cpsr(VFlash *vf);
 int       vflash_is_thumb(VFlash *vf);
-/* Read/write RAM directly (addr is virtual, returns 0 if unmapped) */
+/* Memory through the MMU, as the CPU sees it (virtual addresses). */
 uint32_t  vflash_read32(VFlash *vf, uint32_t addr);
-/* Current MMU translation of a virtual address (diagnostics). */
-uint32_t  vflash_translate(VFlash *vf, uint32_t va);
 uint8_t   vflash_read8(VFlash *vf, uint32_t addr);
 void      vflash_write32(VFlash *vf, uint32_t addr, uint32_t val);
 /* Execute exactly one instruction; returns cycles consumed */
 int       vflash_step(VFlash *vf);
-/* Breakpoints (max 16) */
+/* Breakpoints (max 16). vflash_run_frame stops at one. */
 void      vflash_bp_set(VFlash *vf, uint32_t addr);
 void      vflash_bp_clear(VFlash *vf, uint32_t addr);
 void      vflash_bp_clear_all(VFlash *vf);
-int       vflash_bp_hit(VFlash *vf);   /* 1 if last step hit a breakpoint */
+int       vflash_bp_hit(VFlash *vf);   /* 1 if the last step or frame hit one */
 uint32_t  vflash_bp_list(VFlash *vf, uint32_t *out, int maxn);
-/* Run until breakpoint or frame end; returns 1 if bp hit */
-int       vflash_run_until_bp(VFlash *vf, int max_cycles);

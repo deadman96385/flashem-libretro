@@ -30,18 +30,13 @@ static inline void w32(ARM9 *c, uint32_t a, uint32_t v){ c->mem_write32(c->mem_c
 static inline void w16(ARM9 *c, uint32_t a, uint16_t v){ c->mem_write16(c->mem_ctx,a&~1u,v); }
 static inline void w8 (ARM9 *c, uint32_t a, uint8_t  v){ c->mem_write8 (c->mem_ctx,a,v);     }
 
-static int cond_ok(ARM9 *cpu, uint32_t cond) {
-    switch(cond){
-    case 0: return  Z_FLAG; case 1: return !Z_FLAG;
-    case 2: return  C_FLAG; case 3: return !C_FLAG;
-    case 4: return  N_FLAG; case 5: return !N_FLAG;
-    case 6: return  V_FLAG; case 7: return !V_FLAG;
-    case 8: return  C_FLAG && !Z_FLAG; case 9: return !C_FLAG || Z_FLAG;
-    case 10: return N_FLAG == V_FLAG;  case 11: return N_FLAG != V_FLAG;
-    case 12: return !Z_FLAG && (N_FLAG == V_FLAG);
-    case 13: return  Z_FLAG || (N_FLAG != V_FLAG);
-    case 14: return 1; default: return 0;
-    }
+/* Bit NZCV of cond_tab[cond] says whether cond passes with those flags:
+ * EQ NE CS CC MI PL VS VC HI LS GE LT GT LE AL, and never for 0xF. */
+static const uint16_t cond_tab[16] = {
+    0xF0F0, 0x0F0F, 0xCCCC, 0x3333, 0xFF00, 0x00FF, 0xAAAA, 0x5555,
+    0x0C0C, 0xF3F3, 0xAA55, 0x55AA, 0x0A05, 0xF5FA, 0xFFFF, 0x0000 };
+static inline int cond_ok(ARM9 *cpu, uint32_t cond) {
+    return cond_tab[cond & 15] >> (CPSR >> 28) & 1;
 }
 
 typedef struct { uint32_t v; int c; } SR;
@@ -53,7 +48,11 @@ static SR bshift(uint32_t val, int type, int amt, int cin) {
     case 1: r.c=(amt<=32)?(int)((val>>(amt-1))&1):0;  r.v=(amt<32)?(val>>amt):0; break;
     case 2: r.c=(int)(((int32_t)val>>(amt<32?amt-1:31))&1);
             r.v=(uint32_t)((int32_t)val>>(amt<32?amt:31)); break;
-    case 3: amt&=31; if(amt){ r.v=(val>>amt)|(val<<(32-amt)); r.c=(int)((val>>(amt-1))&1); } break;
+    case 3:
+        amt&=31;
+        if(amt){ r.v=(val>>amt)|(val<<(32-amt)); r.c=(int)((val>>(amt-1))&1); }
+        else r.c=(int)(val>>31);
+        break;
     }
     return r;
 }
@@ -67,6 +66,7 @@ static SR decode_shift(ARM9 *cpu, uint32_t insn) {
     if(insn&(1<<4)) { amt=cpu->r[(insn>>8)&0xF]&0xFF; }
     else { amt=(insn>>7)&0x1F;
         if(!amt && type==3){ SR r; r.c=val&1; r.v=(val>>1)|((uint32_t)C_FLAG<<31); return r; }
+        if(!amt && (type==1 || type==2)) amt=32;   /* LSR #32 / ASR #32 */
     }
     return bshift(val,type,amt,C_FLAG);
 }
@@ -75,28 +75,43 @@ static uint32_t decode_imm(uint32_t insn){
     return rot?(i>>rot)|(i<<(32-rot)):i;
 }
 
+/* Banked registers. R8-R12 have one copy for FIQ and one for every other
+ * mode; R13/R14 one per privileged mode plus one USR and SYS share. Leaving a
+ * mode files its registers away, entering one brings its own back. */
 static void save_bank(ARM9 *cpu, int m) {
-    switch(m&0x1F){
-    case ARM9_MODE_FIQ:
+    m &= 0x1F;
+    if (m == ARM9_MODE_FIQ) {
         cpu->r8_fiq=cpu->r[8];cpu->r9_fiq=cpu->r[9];cpu->r10_fiq=cpu->r[10];
         cpu->r11_fiq=cpu->r[11];cpu->r12_fiq=cpu->r[12];
-        cpu->r13_fiq=cpu->r[13];cpu->r14_fiq=cpu->r[14];cpu->spsr_fiq=cpu->spsr; break;
+    } else {
+        cpu->r8_usr=cpu->r[8];cpu->r9_usr=cpu->r[9];cpu->r10_usr=cpu->r[10];
+        cpu->r11_usr=cpu->r[11];cpu->r12_usr=cpu->r[12];
+    }
+    switch(m){
+    case ARM9_MODE_FIQ: cpu->r13_fiq=cpu->r[13];cpu->r14_fiq=cpu->r[14];cpu->spsr_fiq=cpu->spsr; break;
     case ARM9_MODE_IRQ: cpu->r13_irq=cpu->r[13];cpu->r14_irq=cpu->r[14];cpu->spsr_irq=cpu->spsr; break;
     case ARM9_MODE_SVC: cpu->r13_svc=cpu->r[13];cpu->r14_svc=cpu->r[14];cpu->spsr_svc=cpu->spsr; break;
     case ARM9_MODE_ABT: cpu->r13_abt=cpu->r[13];cpu->r14_abt=cpu->r[14];cpu->spsr_abt=cpu->spsr; break;
     case ARM9_MODE_UND: cpu->r13_und=cpu->r[13];cpu->r14_und=cpu->r[14];cpu->spsr_und=cpu->spsr; break;
+    default:            cpu->r13_usr=cpu->r[13];cpu->r14_usr=cpu->r[14]; break;
     }
 }
 static void load_bank(ARM9 *cpu, int m) {
-    switch(m&0x1F){
-    case ARM9_MODE_FIQ:
+    m &= 0x1F;
+    if (m == ARM9_MODE_FIQ) {
         cpu->r[8]=cpu->r8_fiq;cpu->r[9]=cpu->r9_fiq;cpu->r[10]=cpu->r10_fiq;
         cpu->r[11]=cpu->r11_fiq;cpu->r[12]=cpu->r12_fiq;
-        cpu->r[13]=cpu->r13_fiq;cpu->r[14]=cpu->r14_fiq;cpu->spsr=cpu->spsr_fiq; break;
+    } else {
+        cpu->r[8]=cpu->r8_usr;cpu->r[9]=cpu->r9_usr;cpu->r[10]=cpu->r10_usr;
+        cpu->r[11]=cpu->r11_usr;cpu->r[12]=cpu->r12_usr;
+    }
+    switch(m){
+    case ARM9_MODE_FIQ: cpu->r[13]=cpu->r13_fiq;cpu->r[14]=cpu->r14_fiq;cpu->spsr=cpu->spsr_fiq; break;
     case ARM9_MODE_IRQ: cpu->r[13]=cpu->r13_irq;cpu->r[14]=cpu->r14_irq;cpu->spsr=cpu->spsr_irq; break;
     case ARM9_MODE_SVC: cpu->r[13]=cpu->r13_svc;cpu->r[14]=cpu->r14_svc;cpu->spsr=cpu->spsr_svc; break;
     case ARM9_MODE_ABT: cpu->r[13]=cpu->r13_abt;cpu->r[14]=cpu->r14_abt;cpu->spsr=cpu->spsr_abt; break;
     case ARM9_MODE_UND: cpu->r[13]=cpu->r13_und;cpu->r[14]=cpu->r14_und;cpu->spsr=cpu->spsr_und; break;
+    default:            cpu->r[13]=cpu->r13_usr;cpu->r[14]=cpu->r14_usr; break;
     }
 }
 static void set_mode(ARM9 *cpu, uint32_t ncpsr){
@@ -484,6 +499,17 @@ static int vfp_mrrc_mcrr(ARM9 *cpu, uint32_t insn) {
 }
 
 static void exec_arm(ARM9 *cpu, uint32_t insn) {
+    if((insn>>28)==0xF){
+        /* ARMv5 unconditional space: BLX <imm> calls Thumb code, the H bit
+         * adding a halfword; PLD and the rest are hints or unpredictable. */
+        if((insn&0x0E000000)==0x0A000000){
+            int32_t off=((int32_t)(insn<<8)>>6)|(int32_t)((insn>>23)&2);
+            LR=PC-4;
+            PC=(uint32_t)((int32_t)PC+off);
+            CPSR|=ARM9_FLAG_T;
+        }
+        return;
+    }
     if(!cond_ok(cpu,insn>>28)) return;
 
     /* BX Rm — Branch and Exchange (ARM→Thumb or Thumb→ARM) */
@@ -517,7 +543,7 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
     if((insn&0x0FB00000)==0x03200000||(insn&0x0FB00FF0)==0x01200000){
         uint32_t val=(insn&(1<<25))?decode_imm(insn):cpu->r[insn&0xF];
         uint32_t mask=0; if(insn&(1<<19)) mask|=0xF0000000u; if(insn&(1<<16)) mask|=0xDFu; /* 0xDF not 0xFF: T bit (bit5) must not be changed by MSR */
-        if(insn&(1<<22)) cpu->spsr=(cpu->spsr&~mask)|(val&mask);
+        if(insn&(1<<22)){ if(insn&(1<<16)) mask|=0x20u; cpu->spsr=(cpu->spsr&~mask)|(val&mask); }
         else set_mode(cpu,(CPSR&~mask)|(val&mask));
         return;
     }
@@ -529,7 +555,7 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
     }
     if((insn&0x0F8000F0)==0x00800090){
         int rdhi=(insn>>16)&0xF,rdlo=(insn>>12)&0xF,rs=(insn>>8)&0xF,rm=insn&0xF;
-        int s=(insn>>20)&1,a=(insn>>21)&1,sgn=!((insn>>22)&1);
+        int s=(insn>>20)&1,a=(insn>>21)&1,sgn=(insn>>22)&1;   /* U bit: 1 = SMULL/SMLAL */
         uint64_t res=sgn?((uint64_t)(int64_t)(int32_t)cpu->r[rm]*(int64_t)(int32_t)cpu->r[rs]):((uint64_t)cpu->r[rm]*cpu->r[rs]);
         if(a) res+=((uint64_t)cpu->r[rdhi]<<32)|cpu->r[rdlo];
         cpu->r[rdhi]=(uint32_t)(res>>32); cpu->r[rdlo]=(uint32_t)res;
@@ -547,6 +573,14 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
         int l=(insn>>20)&1,rn=(insn>>16)&0xF,rd=(insn>>12)&0xF,sh=(insn>>5)&3;
         uint32_t off=imm?(((insn>>4)&0xF0)|(insn&0xF)):cpu->r[insn&0xF];
         uint32_t base=cpu->r[rn], addr=p?(u?base+off:base-off):base;
+        if(!l && sh>=2){
+            /* LDRD (SH=2) / STRD (SH=3): Rd, Rd+1 at addr, addr+4 */
+            if(sh==2){ cpu->r[rd]=r32(cpu,addr); cpu->r[rd+1]=r32(cpu,addr+4); }
+            else     { w32(cpu,addr,cpu->r[rd]); w32(cpu,addr+4,cpu->r[rd+1]); }
+            if(!p) addr=u?base+off:base-off;
+            if(!p||w) cpu->r[rn]=addr;
+            return;
+        }
         if(l){ uint32_t v=0;
             if(sh==1) v=r16(cpu,addr);
             else if(sh==2) v=(uint32_t)(int32_t)(int8_t)r8(cpu,addr);
@@ -644,7 +678,7 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
         case 0xE: res=a&~b; if(s){SET_NZ(res);SET_C(shc);} break;
         case 0xF: res=~b;   if(s){SET_NZ(res);SET_C(shc);} break;
         }
-        if(wr){ cpu->r[rd]=res; if(rd==15){ if(s) set_mode(cpu,cpu->spsr); PC&=~3u; } }
+        if(wr){ cpu->r[rd]=res; if(rd==15){ if(s) set_mode(cpu,cpu->spsr); PC&=(CPSR&ARM9_FLAG_T)?~1u:~3u; } }
         return;
     }
     if((insn&0x0C000000)==0x04000000){
@@ -654,10 +688,12 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
         uint32_t off=i?decode_shift(cpu,insn).v:(insn&0xFFF);
         uint32_t addr=p?(u?base+off:base-off):base;
         if(l){
-            uint32_t v=b?r8(cpu,addr):r32(cpu,addr);
+            uint32_t v;
+            if(b) v=r8(cpu,addr);
+            else { int rot=(addr&3)*8; v=r32(cpu,addr); if(rot) v=(v>>rot)|(v<<(32-rot)); }
             cpu->r[rd]=v;
-            /* LDR PC: loaded value becomes new PC (word-aligned) */
-            if(rd==15) PC = v & ~3u;
+            /* LDR PC interworks on ARMv5: bit 0 selects Thumb. */
+            if(rd==15){ if(v&1){ CPSR|=ARM9_FLAG_T; PC=v&~1u; } else PC=v&~3u; }
         } else {
             /* STR PC: stored value = current PC = inst+8 (already set) */
             uint32_t v = (rd==15) ? PC : cpu->r[rd];
@@ -687,16 +723,18 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
                 /* LDM with PC in list: loaded value IS the new PC.
                  * If S-bit (bit22) set and PC in list → restore CPSR from SPSR */
                 if(i==15) {
-                    PC = v & ~3u;
-                    if(insn & (1<<22))
+                    if(insn & (1<<22)) {
                         set_mode(cpu, cpu->spsr);
+                        PC = v & ((CPSR & ARM9_FLAG_T) ? ~1u : ~3u);
+                    } else if(v & 1) { CPSR|=ARM9_FLAG_T; PC=v&~1u; }
+                    else PC = v & ~3u;
                 }
             } else {
                 w32(cpu,addr,cpu->r[i]);
             }
             addr+=4;
         }
-        if(w) cpu->r[rn]=u?base+(uint32_t)(cnt*4):base-(uint32_t)(cnt*4);
+        if(w && !(l && (rlist>>rn&1))) cpu->r[rn]=u?base+(uint32_t)(cnt*4):base-(uint32_t)(cnt*4);
         return;
     }
     /* MCRR/MRRC — Coprocessor double register transfer (VFP: VMOV Dm, Rd, Rn) */
@@ -783,7 +821,6 @@ static void exec_thumb(ARM9 *cpu, uint16_t insn) {
 void arm9_reset(ARM9 *cpu) {
     memset(cpu->r,0,sizeof(cpu->r));
     CPSR=ARM9_MODE_SVC|ARM9_FLAG_I|ARM9_FLAG_F; cpu->spsr=0; PC=0; cpu->cycles=0;
-    cpu->null_trap_enabled = 0;
     cp15_reset(&cpu->cp15);
     printf("[ARM9] Reset PC=0x%08X CPSR=0x%08X\n",PC,CPSR);
 }
@@ -850,364 +887,39 @@ static int insn_cycles_thumb(uint16_t insn) {
  *
  * Thumb pipeline: PC = inst+4 during execution. Same logic, smaller delta.
  */
-/* Where execution ran off to, and how it got there. Enabled with VFLASH_WILD=1:
- * the last addresses executed are kept in a ring, and the first time the PC
- * lands outside the regions that hold code - the vectors and ROM stub below
- * 0x2000, and the 16 MB of SDRAM - the ring is printed. That names the jump
- * that left the rails, which a PC sitting on the IRQ vector never does. */
-#define WILD_RING 12
-static uint32_t wild_ring[WILD_RING];
-static int      wild_ring_pos;
-static uint32_t wild_jump_from, wild_jump_to;  /* last non-sequential step */
-static int      wild_state = -1;   /* -1 unknown, 0 armed, 1 done, -2 off */
-
-static void wild_check(ARM9 *cpu, uint32_t addr, uint32_t insn)
-{
-    if (wild_state == -1)
-        wild_state = getenv("VFLASH_WILD") ? 0 : -2;
-    if (wild_state != 0)
-        return;
-
-    /* Every entry into the low region is a call into the boot ROM that is not
-     * there. Only 0x1880 is stubbed, so name the others: they are the HLE gaps. */
-    {
-        uint32_t prev = wild_ring[(wild_ring_pos + WILD_RING - 2) % WILD_RING];
-        static int romcall_seen;
-        if (addr < 0x2000 && prev >= 0x10000000 && romcall_seen < 12) {
-            printf("[ROMCALL] %08X from %08X LR=%08X R0=%08X R1=%08X\n",
-                   addr, prev, cpu->r[14], cpu->r[0], cpu->r[1]);
-            romcall_seen++;
-        }
-    }
-    /* Executing the µMORE task table is not "out of range" by address, but it
-     * is just as wrong, so it counts as landing off the rails - and so is the
-     * RTOS halt loop at 0x109D4BBC, which counts to 254 and starts again
-     * forever: reaching it means a check failed somewhere, and the ring says
-     * where it was called from. */
-    if (!(addr >= 0x10B0DF00 && addr < 0x10B0E000) &&
-        !(addr >= 0x109D4BBC && addr <= 0x109D4BCC) &&
-        (addr < 0x2000 || (addr >= 0x10000000 && addr < 0x11000000)))
-        return;
-    printf("[WILD] PC=%08X insn=%08X LR=%08X SP=%08X CPSR=%08X\n",
-           addr, insn, cpu->r[14], cpu->r[13], CPSR);
-    {
-        extern uint32_t vflash_translate(void *vf, uint32_t va);
-        printf("[WILD] VA 0x1880 translates to %08X\n",
-               vflash_translate(cpu->mem_ctx, 0x1880));
-    }
-    {
-        static const uint32_t watch[] = {
-            0x00000018, 0x00000038, 0x1000FF98, 0x1000FFB8,
-            0x10FFF200, 0x10FFF234, 0x10FFF24C, 0x10FFFA58
-        };
-        for (unsigned k = 0; k < sizeof(watch)/sizeof(watch[0]); k++)
-            printf("[WILD] [%08X] = %08X\n", watch[k],
-                   cpu->mem_read32(cpu->mem_ctx, watch[k]));
-    }
-    printf("[WILD] last jump: %08X -> %08X\n", wild_jump_from, wild_jump_to);
-    printf("[WILD] came from:");
-    for (int k = 0; k < WILD_RING; k++) {
-        uint32_t a = wild_ring[(wild_ring_pos + k) % WILD_RING];
-        if (a) printf(" %08X", a);
-    }
-    printf("\n");
-    wild_state = 1;
+/* Instruction fetch through the cached host page when there is one. */
+static inline const uint8_t *fetch_host(ARM9 *cpu, uint32_t a) {
+    if (cpu->fetch_ptr && (a & ~0xFFFu) == cpu->fetch_page && cpu->fetch_gen == cpu->cp15.tlb_gen)
+        return cpu->fetch_ptr + (a & 0xFFF);
+    if (!cpu->mem_page) return NULL;
+    const uint8_t *p = cpu->mem_page(cpu->mem_ctx, a);
+    cpu->fetch_ptr = p;
+    cpu->fetch_page = a & ~0xFFFu;
+    cpu->fetch_gen = cpu->cp15.tlb_gen;   /* after the lookup, which may flush */
+    return p ? p + (a & 0xFFF) : NULL;
 }
 
 int arm9_step(ARM9 *cpu) {
+    uint32_t inst_addr = PC;
     int cyc;
-    uint32_t inst_addr;
-
+    const uint8_t *h = fetch_host(cpu, inst_addr);
     if (T_FLAG) {
-        inst_addr = PC;
-        uint16_t i = r16(cpu, inst_addr);
-        PC = inst_addr + 4;             /* Thumb pipeline: PC = inst+4 */
+        uint16_t i;
+        if (h) memcpy(&i, h, 2); else i = r16(cpu, inst_addr);
+        PC = inst_addr + 4;
         exec_thumb(cpu, i);
-        if (PC == inst_addr + 4)        /* sequential: advance to next */
-            PC = inst_addr + 2;
+        if (PC == inst_addr + 4) PC = inst_addr + 2;
         cyc = insn_cycles_thumb(i);
     } else {
-        inst_addr = PC;
-        uint32_t i = r32(cpu, inst_addr);
-        PC = inst_addr + 8;
-
-        {
-            uint32_t prev_addr = wild_ring[(wild_ring_pos + WILD_RING - 1) % WILD_RING];
-            if (inst_addr != prev_addr + 4) {
-                wild_jump_from = prev_addr;
-                wild_jump_to   = inst_addr;
-            }
-        }
-        wild_ring[wild_ring_pos] = inst_addr;
-        wild_ring_pos = (wild_ring_pos + 1) % WILD_RING;
-        if (__builtin_expect(wild_state == -1, 0))
-            wild_state = getenv("VFLASH_WILD") ? 0 : -2;
-        if (__builtin_expect(wild_state == 0, 0))
-            wild_check(cpu, inst_addr, i);
-
-        /* IRQ vector chain trace: log what CPU fetches/executes at 0x18 */
-        if (inst_addr == 0x18 && (CPSR & 0x1F) == 0x12) { /* IRQ mode */
-            static int irq_vec_trace = 0;
-            if (irq_vec_trace < 5) {
-                /* Simulate what LDR PC,[PC,#0xD24] would load */
-                uint32_t pool_va = 0x18 + 8 + 0xD24; /* = 0xD44 */
-                uint32_t pool_val = cpu->mem_read32(cpu->mem_ctx, pool_va);
-                printf("[IRQ-VEC-TRACE] PC=0x18 insn=%08X pool[0x%X]=%08X LR=%08X CPSR=%08X\n",
-                       i, pool_va, pool_val, cpu->r[14], CPSR);
-                irq_vec_trace++;
-            }
-        }
-        /* Also trace first instruction after vector jump */
-        if (inst_addr >= 0x1000FF90 && inst_addr <= 0x1000FFD0 && (CPSR & 0x1F) == 0x12) {
-            static int chain_trace = 0;
-            if (chain_trace < 5) {
-                printf("[IRQ-CHAIN] PC=%08X insn=%08X\n", inst_addr, i);
-                chain_trace++;
-            }
-        }
-        if (inst_addr >= 0x10FFF200 && inst_addr <= 0x10FFF240) {
-            static int handler_trace = 0;
-            if (handler_trace < 5) {
-                printf("[IRQ-HANDLER] PC=%08X insn=%08X CPSR=%08X\n", inst_addr, i, CPSR);
-                handler_trace++;
-            }
-        }
-
-        /* Game init trace: log BL calls and returns */
-        /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
-         * a NULL pointer into BSS, auto-return to skip the call.
-         * Only active for calls FROM BOOT.BIN code (0x10C00000+). */
-        /* Trace init BLs and scheduler */
-        {
-            /* Trace memcpy: focus on CMN+BNE at 0x328-0x330 */
-            if (inst_addr >= 0x324 && inst_addr <= 0x334) {
-                static int fn_log = 0;
-                if (fn_log < 10) {
-                    printf("[FN2B4] PC=%08X insn=%08X R2=%08X CPSR=%08X Z=%d\n",
-                           inst_addr, i, cpu->r[2], CPSR, (CPSR >> 30) & 1);
-                    fn_log++;
-                }
-            }
-            if (inst_addr == 0x340) {
-                static int mcpy_log = 0;
-                if (mcpy_log < 3) {
-                    printf("[MCPY] STR: *0x%08X = 0x%08X (iter %d)\n",
-                           cpu->r[3], cpu->r[2], mcpy_log);
-                    mcpy_log++;
-                }
-            }
-            /* Trace when 0x10010234 gets written */
-            if (inst_addr == 0x340 && cpu->r[3] == 0x10010234) {
-                printf("[MCPY] *** Writing scheduler: *0x10010234 = 0x%08X ***\n", cpu->r[2]);
-            }
-            /* Check ram[0x10234] after each init BL returns */
-            if (inst_addr >= 0x118 && inst_addr <= 0x138) {
-                uint32_t chk = cpu->mem_read32(cpu->mem_ctx, 0x10010234);
-                static uint32_t last_chk = 0;
-                if (chk != last_chk) {
-                    printf("[CHK] at PC=%08X: ram[0x10234]=%08X\n", inst_addr, chk);
-                    last_chk = chk;
-                }
-            }
-            if (inst_addr >= 0x118 && inst_addr <= 0x138 && (i & 0x0F000000) == 0x0B000000) {
-                static int bl_log = 0;
-                if (bl_log < 10) {
-                    int32_t off = i & 0xFFFFFF;
-                    if (off & 0x800000) off |= (int32_t)0xFF000000;
-                    uint32_t target = inst_addr + 8 + (uint32_t)(off * 4);
-                    printf("[INIT-BL] PC=%08X → BL 0x%08X\n", inst_addr, target);
-                    bl_log++;
-                }
-            }
-            /* Log scheduler entry and BL calls from init */
-            if (inst_addr == 0x10010234) {
-                printf("[SCHED] Entry: insn=%08X SP=%08X\n", i, cpu->r[13]);
-            }
-            /* Trace BLs from scheduler init code */
-            if (inst_addr >= 0x10010240 && inst_addr <= 0x10010290 &&
-                (i & 0x0F000000) == 0x0B000000) {
-                static int sbl = 0;
-                if (sbl < 10) {
-                    int32_t boff = i & 0xFFFFFF;
-                    if (boff & 0x800000) boff |= (int32_t)0xFF000000;
-                    uint32_t tgt = inst_addr + 8 + (uint32_t)(boff * 4);
-                    printf("[SCHED-BL] 0x%08X → BL 0x%08X R0=%08X R1=%08X\n",
-                           inst_addr, tgt, cpu->r[0], cpu->r[1]);
-                    sbl++;
-                }
-            }
-            /* Track PLL wait loop (VA 0x18E0, not 0x100018E0) */
-            if (inst_addr == 0x18E0 || inst_addr == 0x100018E0) {
-                static int pll_log = 0;
-                if (pll_log < 3) {
-                    printf("[PLL-WAIT] R0=%08X R3=%08X SP=%08X\n",
-                           cpu->r[0], cpu->r[3], cpu->r[13]);
-                    pll_log++;
-                }
-            }
-            if (inst_addr == 0x18E4 || inst_addr == 0x100018E4) {
-                static int pll_ret = 0;
-                if (pll_ret < 3)
-                    printf("[PLL-RET] R0=%08X (bit7=%d)\n", cpu->r[0], (cpu->r[0]>>7)&1);
-                pll_ret++;
-            }
-            /* Track ALL branches from µMORE kernel area */
-            if (inst_addr >= 0x10090000 && inst_addr < 0x10B00000) {
-                int is_bl = (i & 0x0F000000) == 0x0B000000;
-                int is_blx_reg = (i & 0x0FFFFFF0) == 0x012FFF30; /* BLX Rn */
-                int is_bx = (i & 0x0FFFFFF0) == 0x012FFF10; /* BX Rn */
-                if (is_bl || is_blx_reg || is_bx) {
-                    static int bl_trace = 0;
-                    if (bl_trace < 30) {
-                        uint32_t target = 0;
-                        if (is_bl) {
-                            int32_t imm = i & 0xFFFFFF;
-                            if (imm & 0x800000) imm -= 0x1000000;
-                            target = inst_addr + 8 + imm * 4;
-                        } else {
-                            target = cpu->r[i & 0xF];
-                        }
-                        printf("[EVPUMP] PC=%08X %s 0x%08X R0=%08X\n",
-                               inst_addr, is_bl?"BL":is_blx_reg?"BLX":"BX",
-                               target, cpu->r[0]);
-                        bl_trace++;
-                    }
-                }
-            }
-            /* Trace first instructions after game task launch */
-            {
-                static int gt_trace = 0;
-                static int gt_active = 0;
-                if (inst_addr == 0x109D1BD0 && !gt_active) {
-                    gt_active = 1;
-                    gt_trace = 0;
-                    printf("[GT-TRACE] Game entry hit!\n");
-                }
-                /* Reset trace when game loop is forced */
-                if (inst_addr == 0x109D1CE0 && gt_trace > 1000) {
-                    gt_active = 1;
-                    gt_trace = 0;
-                    printf("[GT-TRACE] Game loop hit — resetting trace!\n");
-                }
-                if (gt_active && gt_trace < 50000) {
-                    static uint32_t gt_last_lr = 0;
-                    static uint32_t gt_last_pc = 0;
-                    /* Log function entries (LR change), skip IRQ/FIQ handler noise */
-                    if (cpu->r[14] != gt_last_lr &&
-                        inst_addr >= 0x10000000 &&
-                        !(inst_addr >= 0xD00 && inst_addr < 0xE00)) {
-                        printf("[GT] %08X: R0=%08X LR=%08X SP=%08X (#%d)\n",
-                               inst_addr, cpu->r[0], cpu->r[14], cpu->r[13], gt_trace);
-                        gt_last_lr = cpu->r[14];
-                    }
-                    gt_last_pc = inst_addr;
-                    gt_trace++;
-                    if (inst_addr < 0x100 && inst_addr != 0x08 && inst_addr != 0x18 && inst_addr != 0x1C) {
-                        printf("[GT] CRASH at PC=%08X!\n", inst_addr);
-                    }
-                }
-            }
-            /* Track when game code (0x10C00000+) transitions to low addr */
-            {
-                static int game_started = 0, crash_log = 0;
-                if (inst_addr >= 0x10C00000 && inst_addr < 0x10E00000)
-                    game_started = 1;
-                if (game_started && !crash_log && inst_addr < 0x10001000 &&
-                    inst_addr != 0x18 && inst_addr != 0x1C &&
-                    !(inst_addr >= 0xD00 && inst_addr < 0xE00)) { /* ROM FIQ handler */
-                    printf("[GAME-CRASH] PC=0x%08X insn=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
-                           inst_addr, i, cpu->r[14], cpu->r[13], CPSR);
-                    crash_log = 1;
-                }
-            }
-            /* Trace task_start function */
-            if (inst_addr >= 0x10085E50 && inst_addr <= 0x10085F50) {
-                static int ts_log = 0;
-                if (ts_log < 30) {
-                    printf("[TSTART] PC=%08X insn=%08X R0=%08X R1=%08X R3=%08X SP=%08X\n",
-                           inst_addr, i, cpu->r[0], cpu->r[1], cpu->r[3], cpu->r[13]);
-                    ts_log++;
-                }
-            }
-        }
-
-        /* Catch jumps to invalid addresses:
-         * - NULL (address 0)
-         * - Kernel vector area (0x10000000-0x10000100)
-         * - Addresses outside any valid memory region (> 0x11000000 and not ROM/peripherals) */
-        if ((inst_addr == 0 ||
-             (inst_addr >= 0x10000000 && inst_addr < 0x10000100) ||
-             (inst_addr > 0x11000000 && inst_addr < 0x80000000) ||
-             (inst_addr >= 0x00200000 && inst_addr < 0x0FFE0000))
-            && cpu->null_trap_enabled) {
-            static int null_blx = 0;
-            if (null_blx < 10)
-                printf("[NULL-BLX] PC=0x%08X LR=0x%08X R0=0x%08X SP=0x%08X\n",
-                       inst_addr, cpu->r[14], cpu->r[0], cpu->r[13]);
-            null_blx++;
-            cpu->r[0] = 0;
-            /* Check if LR and SP are valid */
-            uint32_t lr = cpu->r[14];
-            uint32_t sp = cpu->r[13];
-            int lr_valid = (lr >= 0x10000100 && lr < 0x11000000) ||
-                           (lr > 0 && lr < 0x00200000);
-            int sp_valid = (sp >= 0x10000000 && sp < 0x11000000);
-            if (lr_valid && sp_valid && lr != inst_addr) {
-                PC = lr & ~3u;
-            } else {
-                /* LR or SP corrupted — jump to game-loop anchor.
-                 * IRQ must stay enabled so timer can drive recovery;
-                 * a B . stub at 0x109D1CE0 is lazy-installed by vflash. */
-                PC = 0x109D1CE0;
-                cpu->r[13] = 0x10B8DAC0; /* safe SP */
-                cpu->cpsr = 0x00000013; /* SVC, IRQ enabled */
-            }
-            cpu->cycles += 1;
-            return 1;
-        }
-
-        /* HLE service intercept: check BEFORE null trap (services are at zero-init addresses) */
-        if (cpu->hle_intercept && cpu->hle_intercept(cpu->hle_ctx, inst_addr)) {
-            cpu->cycles += 1;
-            return 1;
-        }
-
-        if (i == 0 && cpu->null_trap_enabled && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
-            static int ntp = 0;
-            static uint32_t last_trap = 0;
-            uint32_t lr = cpu->r[14] & ~3u;
-            if (ntp < 50 && inst_addr != last_trap)
-                printf("[NULL-TRAP] 0x%08X (LR=0x%08X R0=0x%08X)\n", inst_addr, lr, cpu->r[0]);
-            last_trap = inst_addr;
-            ntp++;
-            cpu->r[0] = 0;
-            /* Detect NOP-sled looping: if we've been here >1000 times, break out */
-            {
-                static int trap_count = 0;
-                trap_count++;
-                if (trap_count > 1000) {
-                    PC = 0x10FFF000; /* escape to idle */
-                    trap_count = 0;
-                    cpu->cycles += 1;
-                    return 1;
-                }
-            }
-            PC = lr;
-            cpu->cycles += 1;
-            return 1;
-        }
-
+        uint32_t i;
+        if (h) memcpy(&i, h, 4); else i = r32(cpu, inst_addr);
         PC = inst_addr + 8;
         exec_arm(cpu, i);
-        /* Detect branch-forward-by-0: if PC == inst_addr+8 AND the
-         * instruction is a B/BL, exec_arm intentionally set PC there.
-         * For non-branch instructions, PC==inst_addr+8 means no change. */
-        if (PC == inst_addr + 8) {
-            if ((i & 0x0E000000) == 0x0A000000 && cond_ok(cpu, i >> 28))
-                { /* branch was taken, PC is correct */ }
-            else
-                PC = inst_addr + 4;
-        }
+        /* PC left at inst+8 means no branch - unless the instruction was a
+         * taken branch to exactly there. */
+        if (PC == inst_addr + 8 &&
+            !((i & 0x0E000000) == 0x0A000000 && cond_ok(cpu, i >> 28)))
+            PC = inst_addr + 4;
         cyc = insn_cycles_arm(i);
     }
     cpu->cycles += (uint64_t)cyc;
@@ -1236,17 +948,7 @@ void arm9_irq(ARM9 *cpu) {
 }
 
 void arm9_fiq(ARM9 *cpu) {
-    static int fiq_log = 0;
-    if (fiq_log < 200) {
-        printf("[ARM9-FIQ] CPSR=%08X F=%d → %s PC=%08X\n",
-               CPSR, (CPSR&ARM9_FLAG_F)?1:0, (CPSR&ARM9_FLAG_F)?"BLOCKED":"DELIVER", PC);
-    }
-    if(CPSR&ARM9_FLAG_F) { fiq_log++; return; }
-    if (fiq_log < 200) {
-        printf("[ARM9-FIQ] Delivering: PC=%08X→0x%08X CPSR=%08X→FIQ\n",
-               PC, vec_base(cpu)+0x1C, CPSR);
-        fiq_log++;
-    }
+    if(CPSR&ARM9_FLAG_F) return;
     save_bank(cpu,CPSR&0x1F);
     cpu->spsr_fiq = CPSR;
     cpu->r14_fiq  = PC + 4;
@@ -1267,33 +969,6 @@ void arm9_swi(ARM9 *cpu) {
 }
 
 void arm9_undef(ARM9 *cpu) {
-    static int undef_count = 0;
-    if (undef_count < 20) {
-        uint32_t bad_pc = PC - 8;
-        uint32_t insn = cpu->mem_read32(cpu->mem_ctx, bad_pc);
-        fprintf(stderr, "[UNDEF] #%d PC=0x%08X insn=0x%08X LR=0x%08X\n",
-                undef_count, bad_pc, insn, cpu->r[14]);
-    }
-    undef_count++;
-
-    /* ROM boot recovery: if UNDEF fires with BOOT.BIN pre-loaded,
-     * the ROM failed to load BOOT.BIN via ATAPI. Redirect to BOOT.BIN
-     * entry at 0x10C00010 (V.Flash BOOT format trampoline).
-     * Also trigger ROM→RAM copy callback if set (for µMORE kernel). */
-    if (undef_count == 1 && (CPSR & 0x1F) == ARM9_MODE_SVC) {
-        /* ROM init hit a NULL function pointer (garbage from SDRAM calibration).
-         * Copy ROM kernel code to RAM to fix this, then RESUME ROM init
-         * (don't redirect to BOOT.BIN). This allows ROM init's task
-         * registration code to run after disc load + BSS clear. */
-        if (cpu->undef_callback)
-            cpu->undef_callback(cpu->mem_ctx);
-        /* NOP the faulting instruction area so it becomes harmless */
-        cpu->mem_write32(cpu->mem_ctx, PC - 8, 0xE1A00000); /* NOP at fault addr */
-        fprintf(stderr, "[UNDEF] Patched + resuming ROM init at 0x%08X\n", PC - 8);
-        PC = PC - 8; /* re-execute the (now NOP'd) instruction */
-        return;
-    }
-
     save_bank(cpu,CPSR&0x1F);
     cpu->spsr_und = CPSR;
     cpu->r14_und  = PC - 4;

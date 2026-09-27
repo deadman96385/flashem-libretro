@@ -12,16 +12,8 @@ static void audio_callback(void *userdata, uint8_t *stream, int len) {
     int16_t *out = (int16_t*)stream;
     int samples = len / sizeof(int16_t);
 
-    for (int i = 0; i < samples; i++) {
-        if (a->read_pos != a->write_pos) {
-            int16_t s = a->buf[a->read_pos];
-            s = (int16_t)((int32_t)s * a->volume / 256);
-            out[i] = s;
-            a->read_pos = (a->read_pos + 1) % a->buf_size;
-        } else {
-            out[i] = 0;
-        }
-    }
+    uint32_t got=audio_pull_samples(a,out,(uint32_t)samples);
+    memset(out+got,0,(size_t)len-got*sizeof(*out));
 }
 #endif /* FLASHEM_NO_SDL */
 
@@ -29,14 +21,16 @@ Audio* audio_create(void) {
     Audio *a = calloc(1, sizeof(Audio));
     a->buf_size = AUDIO_BUF_SAMPLES * 64; /* large buffer for MJP audio */
     a->buf = calloc(a->buf_size, sizeof(int16_t));
-    a->volume = 200;
+    atomic_init(&a->read_pos,0);
+    atomic_init(&a->write_pos,0);
+    atomic_init(&a->volume,200);
     return a;
 }
 
 void audio_destroy(Audio *a) {
     if (!a) return;
 #ifndef FLASHEM_NO_SDL
-    if (a->initialized) SDL_CloseAudio();
+    if (a->device) SDL_CloseAudioDevice(a->device);
 #endif
     free(a->buf);
     free(a);
@@ -52,14 +46,17 @@ int audio_init_sdl(Audio *a) {
     want.callback = audio_callback;
     want.userdata = a;
 
-    if (SDL_OpenAudio(&want, &got) < 0) {
-        fprintf(stderr, "[Audio] SDL_OpenAudio failed: %s\n", SDL_GetError());
+    /* Keep the callback in our PCM format; SDL converts for WASAPI/other
+     * hardware formats instead of making the callback interpret floats. */
+    a->device = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    if (!a->device) {
+        fprintf(stderr, "[Audio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return 0;
     }
 
     printf("[Audio] Init: %dHz %dch fmt=0x%X buf=%d\n",
            got.freq, got.channels, got.format, got.samples);
-    SDL_PauseAudio(0);
+    SDL_PauseAudioDevice(a->device, 0);
     a->initialized = 1;
     return 1;
 }
@@ -78,35 +75,57 @@ void audio_init_external(Audio *a) {
         a->initialized = 1;
 }
 
+void audio_clear(Audio *a) {
+    if (!a) return;
+#ifndef FLASHEM_NO_SDL
+    if (a->device) SDL_LockAudioDevice(a->device);
+#endif
+    atomic_store(&a->read_pos, atomic_load(&a->write_pos));
+#ifndef FLASHEM_NO_SDL
+    if (a->device) SDL_UnlockAudioDevice(a->device);
+#endif
+}
+
+void audio_set_discard(Audio *a, int discard) {
+    if (!a) return;
+    discard = !!discard;
+    if (a->discard != discard) audio_clear(a);
+    a->discard = discard;
+}
+
 /* How many samples are waiting, and moving them out. Both are the ring buffer
  * arithmetic the SDL callback does, in a form a pull-based frontend can use. */
 uint32_t audio_available(const Audio *a) {
     if (!a || !a->buf)
         return 0;
-    if (a->write_pos >= a->read_pos)
-        return a->write_pos - a->read_pos;
-    return a->buf_size - a->read_pos + a->write_pos;
+    uint32_t read=atomic_load(&a->read_pos),write=atomic_load(&a->write_pos);
+    return write>=read?write-read:a->buf_size-read+write;
 }
 
 uint32_t audio_pull_samples(Audio *a, int16_t *out, uint32_t max) {
-    uint32_t n = 0;
     if (!a || !a->buf || !out)
         return 0;
-    while (n < max && a->read_pos != a->write_pos) {
-        int32_t s = a->buf[a->read_pos];
-        out[n++] = (int16_t)(s * (int32_t)a->volume / 256);
-        a->read_pos = (a->read_pos + 1) % a->buf_size;
+    uint32_t n=audio_available(a),read=atomic_load(&a->read_pos),volume=atomic_load(&a->volume);
+    if(n>max)n=max;
+    n&=~1u;
+    for(uint32_t i=0;i<n;i++) {
+        out[i]=(int16_t)((int32_t)a->buf[read]*(int32_t)volume/256);
+        read=(read+1)%a->buf_size;
     }
+    atomic_store(&a->read_pos,read);
     return n;
 }
 
 void audio_push_samples(Audio *a, const int16_t *samples, uint32_t count) {
+    if(!a || !a->buf || !samples || a->buf_size<2 || a->discard)return;
+    uint32_t space=a->buf_size-1-audio_available(a),write=atomic_load(&a->write_pos);
+    if(count>space)count=space;
+    count&=~1u;
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t next = (a->write_pos + 1) % a->buf_size;
-        if (next == a->read_pos) break;  /* Buffer full */
-        a->buf[a->write_pos] = samples[i];
-        a->write_pos = next;
+        a->buf[write]=samples[i];
+        write=(write+1)%a->buf_size;
     }
+    atomic_store(&a->write_pos,write);
 }
 
 void audio_set_volume(Audio *a, uint32_t vol) {
@@ -190,7 +209,7 @@ void audio_decode_ima_adpcm(Audio *a, const uint8_t *data, uint32_t size) {
     if (!a || !data || size < 4) return;
 
     /* 4-byte header: predictor(2) + step_index(1) + reserved(1) */
-    int16_t predictor = (int16_t)(data[0] | (data[1] << 8));
+    int32_t predictor = (int16_t)(data[0] | (data[1] << 8));
     int step_idx = data[2];
     if (step_idx > 88) step_idx = 88;
 
@@ -206,7 +225,7 @@ void audio_decode_ima_adpcm(Audio *a, const uint8_t *data, uint32_t size) {
             if (nibble & 2) diff += step >> 1;
             if (nibble & 4) diff += step;
             if (nibble & 8) diff = -diff;
-            predictor = (int16_t)(predictor + diff);
+            predictor += diff;
             if (predictor > 32767) predictor = 32767;
             if (predictor < -32768) predictor = -32768;
             step_idx += ima_index_table[nibble];

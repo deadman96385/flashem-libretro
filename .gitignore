@@ -15,3 +15,7 @@ flashem
 *.so
 *.dylib
 *.dll
+
+# Windows build (make platform=win / Makefile.libretro platform=win)
+*.win.o
+*.exe

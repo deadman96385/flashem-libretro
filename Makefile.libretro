@@ -2,9 +2,8 @@
 #  libretro core build
 #
 #  The core is the emulator without its SDL frontend: no window, no SDL audio
-#  device, no debugger. What it needs is a C compiler, libm and libjpeg - the
-#  MJP video decoder uses it - so FLASHEM_NO_SDL keeps audio.c from reaching
-#  for SDL headers that a core build has no reason to carry.
+#  device, no debugger. All it needs is a C compiler and libm; FLASHEM_NO_SDL
+#  keeps audio.c from reaching for SDL headers a core build has no use for.
 #
 #  make -f Makefile.libretro platform=unix
 # ─────────────────────────────────────────────────────────────
@@ -25,18 +24,20 @@ CORE_DIR := .
 SOURCES_C := \
 	$(CORE_DIR)/src/flashem_libretro.c \
 	$(CORE_DIR)/src/vflash.c \
+	$(CORE_DIR)/src/hw.c \
+	$(CORE_DIR)/src/zevio_dsp.c \
+	$(CORE_DIR)/src/zsp400.c \
+	$(CORE_DIR)/src/midi.c \
+	$(CORE_DIR)/src/cdda_dma.c \
 	$(CORE_DIR)/src/arm9.c \
 	$(CORE_DIR)/src/cp15.c \
 	$(CORE_DIR)/src/cdrom.c \
-	$(CORE_DIR)/src/mjp.c \
+	$(CORE_DIR)/src/cdsp.c \
+	$(CORE_DIR)/src/ge.c \
 	$(CORE_DIR)/src/audio.c \
-	$(CORE_DIR)/src/ptx.c \
-	$(CORE_DIR)/src/ztimer.c \
-	$(CORE_DIR)/src/disasm.c \
-	$(CORE_DIR)/src/debugger.c \
-	$(CORE_DIR)/src/jit.c
+	$(CORE_DIR)/src/disasm.c
 
-LIBS := -ljpeg -lm
+LIBS := -lm
 fpic :=
 SHARED :=
 
@@ -89,7 +90,12 @@ else ifeq ($(platform), emscripten)
 # ── Windows (MinGW) ──────────────────────────────────────────
 else
 	TARGET := $(TARGET_NAME)_libretro.dll
-	CC ?= gcc
+	# cross-compiling from Linux/WSL: MinGW-w64 unless CC was given
+	ifneq ($(OS),Windows_NT)
+		ifeq ($(origin CC),default)
+			CC := x86_64-w64-mingw32-gcc
+		endif
+	endif
 	SHARED := -shared -static-libgcc -Wl,--no-undefined $(LINK_VERSION_SCRIPT)
 endif
 
@@ -99,10 +105,20 @@ else
 	CFLAGS += -O2 -DNDEBUG
 endif
 
-OBJECTS := $(SOURCES_C:.c=.o)
+# Own suffix, so objects left by the standalone Makefile (built without -fPIC
+# and with SDL) are never linked into the core.
+OBJECTS := $(SOURCES_C:.c=.lr.o)
 CFLAGS  += -Wall -Wextra -std=gnu11 $(fpic) -I$(CORE_DIR)/src -DFLASHEM_NO_SDL
 
 all: $(TARGET)
+
+src/hw.lr.o: src/zevio_dsp.h src/zsp400.h src/midi.h src/cdda_dma.h src/cdsp.h
+src/cdsp.lr.o: src/cdsp.h
+src/zevio_dsp.lr.o: src/zevio_dsp.h src/zsp400.h
+src/zsp400.lr.o: src/zsp400.h
+src/midi.lr.o: src/midi.h
+src/cdda_dma.lr.o: src/cdda_dma.h
+src/audio.lr.o src/vflash.lr.o src/flashem_libretro.lr.o: src/audio.h
 
 ifeq ($(STATIC_LINKING), 1)
 $(TARGET): $(OBJECTS)
@@ -112,7 +128,7 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(fpic) $(SHARED) $(LDFLAGS) -o $@ $(OBJECTS) $(LIBS)
 endif
 
-%.o: %.c
+%.lr.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

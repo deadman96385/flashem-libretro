@@ -16,6 +16,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)   /* Windows mkdir has no mode */
+#endif
 #include <errno.h>
 
 #ifdef HAVE_PNG
